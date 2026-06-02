@@ -19443,23 +19443,13 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
-        if (e->mtp_ready &&
-            !ds4_gpu_set_model_map_range(e->mtp_model.map,
-                                           e->mtp_model.size,
-                                           e->mtp_model.tensor_data_pos,
-                                           e->mtp_model.size - e->mtp_model.tensor_data_pos,
-                                           e->mtp_model.max_tensor_bytes))
-        {
-            fprintf(stderr,
-                    "ds4: %s failed to map MTP model views; aborting startup. "
-                    "This is commonly caused by insufficient memory or accelerator VM budget.\n",
-                    ds4_backend_name(e->backend));
-            free(load_offsets);
-            free(load_sizes);
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
+        /* Cache the PRIMARY model's tensor ranges first. The MTP support model
+         * is handled afterwards as a *secondary* set of ranges (below). It must
+         * NOT be routed through ds4_gpu_set_model_map_range(): that path resets
+         * the singular model-map globals and releases the primary model's cached
+         * ranges (the device cache identifies "the model" by a single host base),
+         * which on CUDA left the primary model re-copied and the MTP device copy
+         * failing with cudaErrorInvalidValue — MTP was unusable on single-GPU. */
         if (!accelerator_cache_model_tensors(e->backend, &e->model,
                                              load_offsets, load_sizes,
                                              load_span_count)) {
@@ -19473,11 +19463,38 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         }
         free(load_offsets);
         free(load_sizes);
-        /* Also apply explicit optional Q8 preload settings to the MTP support
-         * model when loaded. */
-        if (e->mtp_ready && !accelerator_cache_model_tensors(e->backend, &e->mtp_model,
-                                                             NULL, NULL, 0)) {
-            fprintf(stderr, "ds4: %s failed to prepare optional MTP model cache\n",
+        /* Register the MTP support model. Only the CUDA backend needs the new
+         * path: its device cache identifies "the model" by a single host base, so
+         * routing MTP through ds4_gpu_set_model_map_range() there would reset the
+         * singular model-map globals and release the primary's cached ranges. CUDA
+         * therefore stages MTP from its own fd as additional device-resident ranges.
+         * Other backends (Metal) keep upstream's set_model_map_range path unchanged
+         * — there it appends model views and does not disturb the primary. */
+        if (e->mtp_ready && e->backend == DS4_BACKEND_CUDA) {
+            /* Point the fd cache at the MTP model (the primary is already
+             * device-resident and no longer consults the fd), then cache it as
+             * additional ranges. Optional: on failure, disable speculative
+             * drafting and keep serving rather than aborting. */
+            if (e->mtp_model.fd >= 0)
+                (void)ds4_gpu_set_model_fd(e->mtp_model.fd);
+            if (!accelerator_cache_model_tensors(e->backend, &e->mtp_model,
+                                                 NULL, NULL, 0)) {
+                fprintf(stderr,
+                        "ds4: %s could not cache the MTP support model; disabling "
+                        "speculative MTP drafting and continuing.\n",
+                        ds4_backend_name(e->backend));
+                e->mtp_ready = false;
+            }
+        } else if (e->mtp_ready &&
+                   !ds4_gpu_set_model_map_range(e->mtp_model.map,
+                                                  e->mtp_model.size,
+                                                  e->mtp_model.tensor_data_pos,
+                                                  e->mtp_model.size - e->mtp_model.tensor_data_pos,
+                                                  e->mtp_model.max_tensor_bytes))
+        {
+            fprintf(stderr,
+                    "ds4: %s failed to map MTP model views; aborting startup. "
+                    "This is commonly caused by insufficient memory or accelerator VM budget.\n",
                     ds4_backend_name(e->backend));
             ds4_engine_close(e);
             *out = NULL;

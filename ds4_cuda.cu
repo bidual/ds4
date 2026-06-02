@@ -1694,8 +1694,22 @@ extern "C" int ds4_gpu_set_model_fd(int fd) {
     return 1;
 }
 
+/* Bind the fd-backed staging cache to the model whose tensors are about to be
+ * staged. ds4_gpu_set_model_fd() captures the fd but ties g_model_fd_host_base
+ * to whatever model was registered at that point (the primary). A secondary
+ * model (e.g. the MTP support model) is staged afterwards from its own fd and
+ * mmap base; without rebinding, cuda_model_range_ptr_from_fd() rejects its map
+ * (model_map != g_model_fd_host_base) and its ranges fall through to the raw-mmap
+ * device copy, which fails with cudaErrorInvalidValue on GB10. Both staging entry
+ * points (range and q8) call this. The fd cache is only read while staging, and
+ * each model is fully staged before the next begins, so retargeting is safe. */
+static void cuda_bind_fd_cache(const void *model_map) {
+    if (g_model_fd >= 0) g_model_fd_host_base = model_map;
+}
+
 extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
     if (!model_map || bytes == 0) return 1;
+    cuda_bind_fd_cache(model_map);
     if (offset > model_size || bytes > model_size - offset) return 0;
     if (cuda_model_range_is_cached(model_map, offset, bytes)) return 1;
 
@@ -1713,6 +1727,7 @@ extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_s
 
 extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label) {
     if (!model_map || bytes == 0) return 1;
+    cuda_bind_fd_cache(model_map);
     if (offset > model_size || bytes > model_size - offset) return 0;
     const char *cache_label = label ? label : "q8_0";
     if (getenv("DS4_CUDA_Q8_F32_PRELOAD") != NULL &&
